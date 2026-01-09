@@ -8,6 +8,10 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+import random
+import time
+from http import HTTPStatus
+
 
 @dataclass(frozen=True)
 class ExtractResult:
@@ -66,9 +70,69 @@ def save_raw_json(*, data: Dict[str, Any], raw_dir: Path, source: str, run_date:
     out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
 
+def post_with_retries(
+    *,
+    client: httpx.Client,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_s: int,
+    attempts: int,
+    base_delay_s: float = 0.8,
+    max_delay_s: float = 8.0,
+) -> httpx.Response:
+    """
+    POST with retries + exponential backoff + jitter.
+
+    Retries on:
+    - network errors / timeouts (httpx.RequestError)
+    - 429 Too Many Requests
+    - 5xx server errors
+    Respects Retry-After header when present.
+    """
+    last_exc: Exception | None = None
+
+    for i in range(1, attempts + 1):
+        try:
+            resp = client.post(url, json=payload, headers=headers, timeout=timeout_s)
+
+            # Retry on rate limiting
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    sleep_s = min(float(retry_after), max_delay_s)
+                else:
+                    sleep_s = min(base_delay_s * (2 ** (i - 1)), max_delay_s)
+                    sleep_s += random.uniform(0, 0.4)
+                time.sleep(sleep_s)
+                continue
+
+            # Retry on transient server errors
+            if 500 <= resp.status_code <= 599:
+                sleep_s = min(base_delay_s * (2 ** (i - 1)), max_delay_s)
+                sleep_s += random.uniform(0, 0.4)
+                time.sleep(sleep_s)
+                continue
+
+            # Success or non-retriable 4xx
+            return resp
+
+        except httpx.RequestError as e:
+            last_exc = e
+            sleep_s = min(base_delay_s * (2 ** (i - 1)), max_delay_s)
+            sleep_s += random.uniform(0, 0.4)
+            time.sleep(sleep_s)
+
+    # If we exhausted attempts, raise the last error if we have one.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("post_with_retries failed without exception (unexpected)")
+
+
 
 def extract_page(
     *,
+    retry_attempts: int = 3,
     client: httpx.Client,
     raw_dir: Path,
     source: str = "ibm_careers",
@@ -94,10 +158,17 @@ def extract_page(
         "Content-Type": "application/json",
     }
 
-    resp = client.post(IBM_SEARCH_ENDPOINT, json=payload, headers=headers, timeout=timeout_s)
+    resp = post_with_retries(
+        client=client,
+        url=IBM_SEARCH_ENDPOINT,
+        payload=payload,
+        headers=headers,
+        timeout_s=timeout_s,
+        attempts=3,  # we'll wire to settings next
+    )
     resp.raise_for_status()
-
     data: Dict[str, Any] = resp.json()
+
 
     # Wrapper is Elasticsearch-like: hits.total.value and hits.hits
     hits = (data.get("hits") or {})
